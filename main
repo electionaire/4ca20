@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""
+Wolf‑Howl Guard: closes the chicken‑house gate when a wolf howl is heard.
+
+Hardware assumed
+----------------
+• Raspberry Pi running Linux
+• USB microphone (mono, 44.1 kHz) available as the default ALSA input
+• Gate motor driven by a relay on GPIO 17 (BCM numbering)
+
+Python packages
+---------------
+pip install numpy sounddevice RPi.GPIO
+"""
+
+import numpy as np
+import sounddevice as sd
+import RPi.GPIO as GPIO
+import time
+from collections import deque
+
+# ---------- USER‑TUNABLE CONSTANTS ------------------------------------------
+FS          = 44_100          # Sample‑rate (Hz)
+WINDOW_SEC  = 1.0             # DFT window length (seconds)
+HOP_SEC     = 0.2             # Step between successive windows (seconds)
+HOWL_BAND   = (150, 1_000)    # Fundamental‑frequency band to monitor (Hz)
+ENERGY_DB   = -25             # dBFS threshold inside HOWL_BAND
+PEAK_RATIO  = 6               # Peak must exceed median‑band energy by this (dB)
+GATE_PIN    = 17              # GPIO pin that drives the relay
+GATE_OPEN_SEC = 30            # How long to keep the gate shut after a howl
+# ---------------------------------------------------------------------------
+
+# Pre‑compute some constants
+N_SAMPLES = int(WINDOW_SEC * FS)
+HOP_SAMPLES = int(HOP_SEC * FS)
+FREQS = np.fft.rfftfreq(N_SAMPLES, 1/FS)
+
+# Minimal window to taper spectral leakage
+WINDOW = 0.5 - 0.5*np.cos(2*np.pi*np.arange(N_SAMPLES)/N_SAMPLES)
+
+# FIFO buffer for the sliding‑window input
+ring = deque(maxlen=N_SAMPLES)
+
+# GPIO setup
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(GATE_PIN, GPIO.OUT, initial=GPIO.LOW)   # LOW = gate open, HIGH = closed
+
+def close_gate():
+    GPIO.output(GATE_PIN, GPIO.HIGH)
+
+def open_gate():
+    GPIO.output(GATE_PIN, GPIO.LOW)
+
+def detect_howl(frame):
+    """
+    Analyse one WINDOW_SEC frame and return True if a howl is present.
+    """
+    # 1. Apply a DFT (here numpy’s FFT gives the same coefficients as a naïve DFT
+    #    but is O(N log N) vs. O(N²); mathematically it *is* the DFT).
+    spectrum = np.fft.rfft(frame * WINDOW)
+    mags = np.abs(spectrum)
+
+    # 2. Convert magnitude to dBFS
+    db = 20*np.log10(mags / (np.finfo(float).eps + mags.max()))
+
+    # 3. Extract the band of interest
+    band_idx = np.where((FREQS >= HOWL_BAND[0]) & (FREQS <= HOWL_BAND[1]))[0]
+    band_energy = db[band_idx]
+
+    # 4. Simple detection logic:
+    #    – Any bin in the band > ENERGY_DB dBFS?
+    #    – Does its peak exceed the band’s median by PEAK_RATIO dB?
+    if band_energy.max() > ENERGY_DB and \
+       (band_energy.max() - np.median(band_energy)) > PEAK_RATIO:
+        return True
+    return False
+
+def audio_callback(indata, frames, time_info, status):
+    """
+    Called by sounddevice every HOP_SAMPLES frames.
+    """
+    # Push samples into our ring buffer
+    ring.extend(indata[:, 0])   # mono
+
+    # Once we have a full window, analyse it
+    if len(ring) == N_SAMPLES:
+        frame = np.array(ring, dtype=np.float32)
+        if detect_howl(frame):
+            print("[!] Wolf howl detected – closing gate")
+            close_gate()
+            # Keep it shut for the configured time,
+            # but still keep listening in a non‑blocking way.
+            sd.sleep(int(GATE_OPEN_SEC * 1000))
+            print("[+] Re‑opening gate")
+            open_gate()
+
+def main():
+    print("Starting Wolf‑Howl Guard. Ctrl‑C to stop.")
+    try:
+        with sd.InputStream(channels=1,
+                            samplerate=FS,
+                            blocksize=HOP_SAMPLES,
+                            callback=audio_callback):
+            while True:
+                time.sleep(1)   # Main thread idle
+    except KeyboardInterrupt:
+        print("\nExiting cleanly.")
+    finally:
+        open_gate()
+        GPIO.cleanup()
+
+if __name__ == "__main__":
+    main()
