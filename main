@@ -1,54 +1,115 @@
 from pathlib import Path
 import numpy as np
-import librosa, librosa.display
 import matplotlib.pyplot as plt
-
+import os 
+from numpy.fft import fft, fftfreq
+from scipy.io import wavfile
 ################################################################################################################################################################
 ################ GUYS CHANGE THE PATH BELOW TO MATCH YOUR PC! - The path you should put here is where THIS file (main.py) is stored ############################
-ROOT   = Path(r"C:\Users\20244239\OneDrive - TU Eindhoven\Documents\4CA20-Farm-Alert-Project\4ca20") 
-OUTDIR = ROOT / "figures"
+# ROOT   = Path(r"C:\Users\20244239\OneDrive - TU Eindhoven\Documents\4CA20-Farm-Alert-Project\4ca20") 
+# OUTDIR = ROOT / "figures"
 ################################################################################################################################################################
 
-OUTDIR.mkdir(exist_ok=True)         # <- Nice, I like this one Egor.
+# OUTDIR.mkdir(exist_ok=True)         # <- Nice, I like this one Egor.
 
 HOP, N_FFT        = 1024, 2048
 FUND_LOW, FUND_HI = 150, 780 # howl fundamental range (Hz)
 
+# Directories
+in_dir  = "sounds"
+out_dir = "figures"
+os.makedirs(out_dir, exist_ok=True)
 
-# Ok so I have made it a lot more efficient when actually opening and finding files
-# Instead of searching the entirety of the PC it will only search specifically where this program is found
-# Also made it a lot more easy for e.g. Karlo to run this as previously it would not work (KARLO YOU JUST GOTTA CHANGE THE PATH AT THE TOP TO MATCH YOUR PC!)
-for wav in ROOT.glob("*.wav"):
+# Analysis parameters
+hop     = 1024         # hop size in samples
+n_fft   = 4096         # FFT size
+low_hz  = 100         # min frequency (Hz)
+high_hz = 300          # max frequency (Hz)
+window  = np.hanning(n_fft)
 
+script_path = os.path.abspath(__file__)
+folder = Path(__file__).resolve().parent
+script_dir = Path(__file__).resolve().parent
+sounds = folder / "sounds"
+print(script_dir)
+# OUTDIR.mkdir(exist_ok=True)
+#          # <- Nice, I like this one Egor.
+for wav in sounds.glob("*.wav"):
+    print("Processing:", wav)
     print("YES THE LOOP RUNS HEEH") # Had issues getting the loop to start but got those sorted.
 
+    
+
+     # 1) load audio
+    sr, y = wavfile.read(wav)
+    # convert to float32 in [–1,1]
+    if y.dtype.kind == 'i':
+        y = y.astype(np.float32) / np.iinfo(y.dtype).max
+    elif y.dtype.kind == 'u':
+        y = (y.astype(np.float32) - 0.5 * np.iinfo(y.dtype).max) / (0.5 * np.iinfo(y.dtype).max)
+    # if stereo, average to mono
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+
+    # 2) frame the signal
+    n_frames = 1 + (len(y) - n_fft) // hop
+    frames = np.lib.stride_tricks.as_strided(
+        y,
+        shape=(n_fft, n_frames),
+        strides=(y.strides[0], hop * y.strides[0])
+    ).copy()
+    frames *= window[:, None]
+
+    # 3) FFT & magnitude
+    X = fft(frames, axis=0)[: n_fft//2 + 1, :]
+    S = np.abs(X)
+
+    # 4) frequency axis
+    # … after computing X and S = np.abs(X) …
+
+    # frequency axis
+    freqs = fftfreq(n_fft, 1.0/sr)[: n_fft//2 + 1]
+
+    # 1) Howl energy per frame
+    band_idx     = np.where((freqs >= low_hz) & (freqs <= high_hz))[0]
+    howl_energy  = S[band_idx, :].mean(axis=0)       # shape: (n_frames,)
+
+    # 2) Spectral centroid per frame
+    centroid     = (freqs[:, None] * S).sum(axis=0) / S.sum(axis=0)
+    print( centroid) 
+    # 3) Thresholding
+    thresh_e     = howl_energy.mean() + 2 * howl_energy.std()
+    thresh_c     = centroid.mean()    + 2 * centroid.std()
+    mask_energy  = howl_energy   > thresh_e
+    mask_centroid= centroid      > thresh_c
+    mask         = mask_energy & mask_centroid     # shape: (n_frames,)
+
+    # 4) Group contiguous True frames into events
+    idx     = mask.astype(int)
+    splits  = np.where(np.diff(idx) != 0)[0] + 1
+    frames  = np.split(np.arange(n_frames), splits)
+    events  = [(f[0]*hop/sr, f[-1]*hop/sr) for f in frames if mask[f[0]]]
+
+    # … plotting code unchanged …
 
 
-    # Ok so next steps is making this our own - To be discussed tonight with Egor 
-    y, sr  = librosa.load(wav, sr=22050, mono=True)
-    S      = np.abs(librosa.stft(y, n_fft=N_FFT, hop_length=HOP))
-    freqs  = librosa.fft_frequencies(sr=sr, n_fft=N_FFT)
+    # 7) convert magnitude to dB
+    S_db = 20 * np.log10(np.maximum(S, 1e-10) / S.max())
 
-    # energy inside the howl-fundamental band
-    band_energy = S[(freqs >= FUND_LOW) & (freqs <= FUND_HI)].mean(axis=0)
-    thresh      = band_energy.mean() + 2 * band_energy.std()
-    idx         = np.where(band_energy > thresh)[0]
-
-    # contiguous frames → (start, end) seconds
-    groups  = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
-    events  = [(g[0] * HOP / sr, g[-1] * HOP / sr) for g in groups if g.size]
-
-
-
-
-
-    # Plotting is pretty good, I expect little change here from this point onwards
+    # 8) plot spectrogram + detected spans
+    times = np.arange(n_frames) * hop / sr
     plt.figure(figsize=(10, 4))
-    librosa.display.specshow(librosa.amplitude_to_db(S, ref=np.max),
-                             sr=sr, hop_length=HOP, x_axis='time', y_axis='linear')
+    plt.pcolormesh(times, freqs, S_db, shading='gouraud')
+    plt.ylabel('Frequency (Hz)')
+    plt.xlabel('Time (s)')
+    plt.title(f"{os.path.basename(wav)} – howl candidates")
+    plt.colorbar(label='Amplitude (dB)')
     for t0, t1 in events:
         plt.axvspan(t0, t1, color='r', alpha=0.3)
-    plt.title(f"{wav.name} – howl candidates")
     plt.tight_layout()
-    plt.savefig(OUTDIR / f"{wav.stem}_analysis.png")
+
+    # 9) save figure
+    base = os.path.splitext(os.path.basename(wav))[0]
+    out_png = os.path.join(out_dir, f"{base}_analysis.png")
+    plt.savefig(out_png)
     plt.close()
