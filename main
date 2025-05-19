@@ -1,31 +1,54 @@
-import os, glob
-import numpy as np, librosa, librosa.display, matplotlib.pyplot as plt
+from pathlib import Path
+import numpy as np
+import librosa, librosa.display
+import matplotlib.pyplot as plt
 
-in_dir  = "sounds"
-out_dir = "figures"
-os.makedirs(out_dir, exist_ok=True)
+################################################################################################################################################################
+################ GUYS CHANGE THE PATH BELOW TO MATCH YOUR PC! - The path you should put here is where THIS file (main.py) is stored ############################
+ROOT   = Path(r"C:\Users\20244239\OneDrive - TU Eindhoven\Documents\4CA20-Farm-Alert-Project\4ca20") 
+OUTDIR = ROOT / "figures"
+################################################################################################################################################################
 
-hop, n_fft = 1024, 2048
-low, high  = 150, 780          # howl fundamental range (Hz)
+OUTDIR.mkdir(exist_ok=True)         # <- Nice, I like this one Egor.
 
-for wav in glob.glob(os.path.join(in_dir, "*.wav")):
-    y, sr = librosa.load(wav, sr=22050, mono=True)
-    S     = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop))
-    f     = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+HOP, N_FFT        = 1024, 2048
+FUND_LOW, FUND_HI = 150, 780 # howl fundamental range (Hz)
 
-    howl_energy = S[(f >= low) & (f <= high)].mean(axis=0)
-    mask = howl_energy > howl_energy.mean() + 2*howl_energy.std()
-    idx  = np.where(mask)[0]
-    groups = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
-    events = [(g[0]*hop/sr, g[-1]*hop/sr) for g in groups if len(g)]
 
-    plt.figure(figsize=(10,4))
+# Ok so I have made it a lot more efficient when actually opening and finding files
+# Instead of searching the entirety of the PC it will only search specifically where this program is found
+# Also made it a lot more easy for e.g. Karlo to run this as previously it would not work (KARLO YOU JUST GOTTA CHANGE THE PATH AT THE TOP TO MATCH YOUR PC!)
+for wav in ROOT.glob("*.wav"):
+
+    print("YES THE LOOP RUNS HEEH") # Had issues getting the loop to start but got those sorted.
+
+
+
+    # Ok so next steps is making this our own - To be discussed tonight with Egor 
+    y, sr  = librosa.load(wav, sr=22050, mono=True)
+    S      = np.abs(librosa.stft(y, n_fft=N_FFT, hop_length=HOP))
+    freqs  = librosa.fft_frequencies(sr=sr, n_fft=N_FFT)
+
+    # energy inside the howl-fundamental band
+    band_energy = S[(freqs >= FUND_LOW) & (freqs <= FUND_HI)].mean(axis=0)
+    thresh      = band_energy.mean() + 2 * band_energy.std()
+    idx         = np.where(band_energy > thresh)[0]
+
+    # contiguous frames → (start, end) seconds
+    groups  = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
+    events  = [(g[0] * HOP / sr, g[-1] * HOP / sr) for g in groups if g.size]
+
+
+
+
+
+    # Plotting is pretty good, I expect little change here from this point onwards
+    plt.figure(figsize=(10, 4))
     librosa.display.specshow(librosa.amplitude_to_db(S, ref=np.max),
-                             sr=sr, hop_length=hop, x_axis='time', y_axis='linear')
+                             sr=sr, hop_length=HOP, x_axis='time', y_axis='linear')
     for t0, t1 in events:
         plt.axvspan(t0, t1, color='r', alpha=0.3)
-    plt.title(f"{os.path.basename(wav)} – howl candidates")
+    plt.title(f"{wav.name} – howl candidates")
     plt.tight_layout()
-    out_png = os.path.join(out_dir, os.path.splitext(os.path.basename(wav))[0] + "_analysis.png")
-    plt.savefig(out_png)
+    plt.savefig(OUTDIR / f"{wav.stem}_analysis.png")
     plt.close()
